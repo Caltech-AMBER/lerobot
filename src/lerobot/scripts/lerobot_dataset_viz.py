@@ -31,19 +31,26 @@ Examples:
 ```
 local$ lerobot-dataset-viz \
     --repo-id lerobot/pusht \
-    --episode-index 0
+    --episodes 0
+```
+
+- Visualize multiple episodes:
+```
+local$ lerobot-dataset-viz \
+    --repo-id lerobot/pusht \
+    --episodes 0-15,17,19-20
 ```
 
 - Visualize data stored on a distant machine with a local viewer:
 ```
 distant$ lerobot-dataset-viz \
     --repo-id lerobot/pusht \
-    --episode-index 0 \
+    --episodes 0-15,17,19-20 \
     --save 1 \
     --output-dir path/to/directory
 
-local$ scp distant:path/to/directory/lerobot_pusht_episode_0.rrd .
-local$ rerun lerobot_pusht_episode_0.rrd
+local$ scp distant:path/to/directory/lerobot_pusht_episodes_0_to_15_17_19_20.rrd .
+local$ rerun lerobot_pusht_episodes_0_to_15_17_19_20.rrd
 ```
 
 - Visualize data stored on a distant machine through streaming:
@@ -52,7 +59,7 @@ local$ rerun lerobot_pusht_episode_0.rrd
 ```
 distant$ lerobot-dataset-viz \
     --repo-id lerobot/pusht \
-    --episode-index 0 \
+    --episodes 0-15,17,19-20 \
     --mode distant \
     --ws-port 9087
 
@@ -78,11 +85,30 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD
 
 
+def parse_episode_ranges(episodes_str: str | None) -> list[int] | None:
+    """Parse episode string like '0-15,17,19-20' into a list of episode indices."""
+    if episodes_str is None:
+        return None
+    episode_indices = []
+    parts = episodes_str.split(',')
+    for part in parts:
+        part = part.strip()
+        if '-' in part:
+            start, end = part.split('-')
+            episode_indices.extend(range(int(start), int(end) + 1))
+        else:
+            episode_indices.append(int(part))
+    return sorted(set(episode_indices))
+
+
 class EpisodeSampler(torch.utils.data.Sampler):
-    def __init__(self, dataset: LeRobotDataset, episode_index: int):
-        from_idx = dataset.meta.episodes["dataset_from_index"][episode_index]
-        to_idx = dataset.meta.episodes["dataset_to_index"][episode_index]
-        self.frame_ids = range(from_idx, to_idx)
+    def __init__(self, dataset: LeRobotDataset, episode_indices: list[int]):
+        self.frame_ids = []
+        # Iterate through all episodes in the filtered dataset
+        for ep_idx in range(len(dataset.meta.episodes)):
+            from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
+            to_idx = dataset.meta.episodes["dataset_to_index"][ep_idx]
+            self.frame_ids.extend(range(from_idx, to_idx))
 
     def __iter__(self) -> Iterator:
         return iter(self.frame_ids)
@@ -102,7 +128,7 @@ def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
 
 def visualize_dataset(
     dataset: LeRobotDataset,
-    episode_index: int,
+    episode_indices: list[int],
     batch_size: int = 32,
     num_workers: int = 0,
     mode: str = "local",
@@ -118,8 +144,27 @@ def visualize_dataset(
 
     repo_id = dataset.repo_id
 
-    logging.info("Loading dataloader")
-    episode_sampler = EpisodeSampler(dataset, episode_index)
+    # Add logging to verify the dataset contains the requested episodes
+    print(f"Requested episodes: {episode_indices}")
+    print(f"Dataset contains {len(dataset.meta.episodes)} episodes")
+    
+    # Verify that all episodes are included
+    if len(dataset.meta.episodes) != len(episode_indices):
+        print(f"Dataset contains {len(dataset.meta.episodes)} episodes, but {len(episode_indices)} were requested")
+        print("Some episodes might not be available in the dataset")
+
+    # Display information about loaded episodes
+    episode_info = []
+    for i in range(len(dataset.meta.episodes)):
+        from_idx = dataset.meta.episodes["dataset_from_index"][i]
+        to_idx = dataset.meta.episodes["dataset_to_index"][i]
+        frames = to_idx - from_idx
+        episode_info.append(f"Episode {i}: {frames} frames")
+    print("Loaded episodes info:")
+    print("\n".join(episode_info))
+
+    print("Loading dataloader")
+    episode_sampler = EpisodeSampler(dataset, episode_indices)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=num_workers,
@@ -127,13 +172,14 @@ def visualize_dataset(
         sampler=episode_sampler,
     )
 
-    logging.info("Starting Rerun")
+    print("Starting Rerun")
 
     if mode not in ["local", "distant"]:
         raise ValueError(mode)
 
     spawn_local_viewer = mode == "local" and not save
-    rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer)
+    episodes_str = "_".join(map(str, episode_indices)) if len(episode_indices) <= 5 else f"{episode_indices[0]}_to_{episode_indices[-1]}"
+    rr.init(f"{repo_id}/episodes_{episodes_str}", spawn=spawn_local_viewer)
 
     # Manually call python garbage collector after `rr.init` to avoid hanging in a blocking flush
     # when iterating on a dataloader with `num_workers` > 0
@@ -141,46 +187,157 @@ def visualize_dataset(
     gc.collect()
 
     if mode == "distant":
-        rr.serve(open_browser=False, web_port=web_port, ws_port=ws_port)
+        rr.serve(open_browser=False, web_port=web_port, ws_port=ws_port)  # type: ignore[attr-defined]
 
-    logging.info("Logging to Rerun")
+    print("Logging to Rerun")
 
+    # Create a mapping from dataset indices to original episode indices for proper naming
+    dataset_to_original_ep = {}
+    for i, ep_idx in enumerate(episode_indices):
+        if i < len(dataset.meta.episodes):
+            dataset_to_original_ep[i] = ep_idx
+    
+    # Organize frames by episode
+    frames_by_episode = {}
+    for ep_idx in range(len(dataset.meta.episodes)):
+        from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
+        to_idx = dataset.meta.episodes["dataset_to_index"][ep_idx]
+        original_ep_idx = dataset_to_original_ep.get(ep_idx, ep_idx)
+        frames_by_episode[ep_idx] = {
+            "original_idx": original_ep_idx,
+            "frames": list(range(from_idx, to_idx)),
+            "data": []
+        }
+
+    # Build a blueprint where each episode has its own container with the associated camera views.
+    preferred_camera_order = ["image", "wrist_image"]
+    # Preserve dataset ordering but make sure the preferred keys appear first when available.
+    ordered_camera_keys = [key for key in preferred_camera_order if key in dataset.meta.camera_keys]
+    ordered_camera_keys.extend(key for key in dataset.meta.camera_keys if key not in ordered_camera_keys)
+
+    camera_view_map: dict[str, list[rr.blueprint.View]] = {key: [] for key in ordered_camera_keys}
+    for episode_info in frames_by_episode.values():
+        episode_root = f"episode_{episode_info['original_idx']}"
+        for camera_key in ordered_camera_keys:
+            camera_view_map[camera_key].append(
+                rr.blueprint.views.Spatial2DView(
+                    origin=f"cameras/{camera_key}/{episode_root}",
+                    name=episode_root,
+                )
+            )
+
+    camera_containers: list[rr.blueprint.Container] = []
+    for camera_key in ordered_camera_keys:
+        views = camera_view_map.get(camera_key, [])
+        if not views:
+            continue
+        camera_containers.append(
+            rr.blueprint.Vertical(
+                name=camera_key,
+                contents=views,
+            )
+        )
+
+    if camera_containers:
+        rr.send_blueprint(
+            rr.blueprint.Blueprint(
+                rr.blueprint.Grid(
+                    name="Cameras",
+                    contents=camera_containers,
+                    grid_columns=len(camera_containers) if len(camera_containers) > 1 else None,
+                ),
+                auto_views=False,
+                auto_layout=False,
+            )
+        )
+
+    # Collect all frame data first, grouped by episode
+    print("Collecting frame data...")
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
         # iterate over the batch
         for i in range(len(batch["index"])):
-            rr.set_time_sequence("frame_index", batch["frame_index"][i].item())
-            rr.set_time_seconds("timestamp", batch["timestamp"][i].item())
-
-            # display each camera image
-            for key in dataset.meta.camera_keys:
-                # TODO(rcadene): add `.compress()`? is it lossless?
-                rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
-
-            # display each dimension of action space (e.g. actuators command)
-            if ACTION in batch:
-                for dim_idx, val in enumerate(batch[ACTION][i]):
-                    rr.log(f"{ACTION}/{dim_idx}", rr.Scalar(val.item()))
-
-            # display each dimension of observed state space (e.g. agent position in joint space)
-            if OBS_STATE in batch:
-                for dim_idx, val in enumerate(batch[OBS_STATE][i]):
-                    rr.log(f"state/{dim_idx}", rr.Scalar(val.item()))
-
-            if DONE in batch:
-                rr.log(DONE, rr.Scalar(batch[DONE][i].item()))
-
-            if REWARD in batch:
-                rr.log(REWARD, rr.Scalar(batch[REWARD][i].item()))
-
-            if "next.success" in batch:
-                rr.log("next.success", rr.Scalar(batch["next.success"][i].item()))
+            dataset_index = batch["index"][i].item()
+            
+            # Determine which episode this frame belongs to
+            current_episode = None
+            for ep_idx in range(len(dataset.meta.episodes)):
+                from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
+                to_idx = dataset.meta.episodes["dataset_to_index"][ep_idx]
+                if from_idx <= dataset_index < to_idx:
+                    current_episode = ep_idx
+                    break
+            
+            if current_episode is not None:
+                # Save this frame's data to the corresponding episode
+                frame_data = {
+                    "frame_index": batch["frame_index"][i].item(),
+                    "timestamp": batch["timestamp"][i].item(),
+                    "dataset_index": dataset_index,
+                }
+                
+                # Extract camera images
+                frame_data["images"] = {}
+                for key in dataset.meta.camera_keys:
+                    frame_data["images"][key] = to_hwc_uint8_numpy(batch[key][i])
+                
+                # Extract other data
+                frame_data["actions"] = {}
+                if ACTION in batch:
+                    for dim_idx, val in enumerate(batch[ACTION][i]):
+                        frame_data["actions"][dim_idx] = val.item()
+                
+                frame_data["state"] = {}
+                if OBS_STATE in batch:
+                    for dim_idx, val in enumerate(batch[OBS_STATE][i]):
+                        frame_data["state"][dim_idx] = val.item()
+                
+                frame_data["metrics"] = {}
+                if DONE in batch:
+                    frame_data["metrics"]["done"] = batch[DONE][i].item()
+                if REWARD in batch:
+                    frame_data["metrics"]["reward"] = batch[REWARD][i].item()
+                if "next.success" in batch:
+                    frame_data["metrics"]["next_success"] = batch["next.success"][i].item()
+                
+                frames_by_episode[current_episode]["data"].append(frame_data)
+    
+    # Now log each episode's data separately with clean entity paths
+    print("Logging episodes to Rerun...")
+    for ep_idx, ep_data in frames_by_episode.items():
+        original_ep_idx = ep_data["original_idx"]
+        print(f"Logging episode {original_ep_idx} with {len(ep_data['data'])} frames")
+        
+        # Process each frame in the episode
+        for frame_data in tqdm.tqdm(ep_data["data"]):
+            episode_root = f"episode_{original_ep_idx}"
+            
+            # Set the time for this frame
+            rr.set_time_sequence("frame", frame_data["frame_index"])
+            
+            # Log all camera images directly under the episode entity
+            for key, img_data in frame_data["images"].items():
+                rr.log(f"cameras/{key}/{episode_root}", rr.Image(img_data))
+            
+            # Log actions
+            for dim_idx, val in frame_data["actions"].items():
+                rr.log(f"{episode_root}/actions/{dim_idx}", rr.Scalars([float(val)]))
+            
+            # Log state
+            for dim_idx, val in frame_data["state"].items():
+                rr.log(f"{episode_root}/state/{dim_idx}", rr.Scalars([float(val)]))
+            
+            # Log metrics
+            for metric_name, val in frame_data["metrics"].items():
+                rr.log(f"{episode_root}/metrics/{metric_name}", rr.Scalars([float(val)]))
 
     if mode == "local" and save:
         # save .rrd locally
+        assert output_dir is not None
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         repo_id_str = repo_id.replace("/", "_")
-        rrd_path = output_dir / f"{repo_id_str}_episode_{episode_index}.rrd"
+        episodes_str = "_".join(map(str, episode_indices)) if len(episode_indices) <= 5 else f"{episode_indices[0]}_to_{episode_indices[-1]}"
+        rrd_path = output_dir / f"{repo_id_str}_episodes_{episodes_str}.rrd"
         rr.save(rrd_path)
         return rrd_path
 
@@ -203,10 +360,13 @@ def main():
         help="Name of hugging face repository containing a LeRobotDataset dataset (e.g. `lerobot/pusht`).",
     )
     parser.add_argument(
-        "--episode-index",
-        type=int,
-        required=True,
-        help="Episode to visualize.",
+        "--episodes",
+        type=str,
+        default=None,
+        help=(
+            "Episodes to visualize. Can be a single episode (e.g. '0'), a range (e.g. '0-15'), or a combination (e.g. '0-15,17,19-20'). "
+            "If omitted, all episodes are shown."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -282,11 +442,20 @@ def main():
     repo_id = kwargs.pop("repo_id")
     root = kwargs.pop("root")
     tolerance_s = kwargs.pop("tolerance_s")
+    episodes_str = kwargs.pop("episodes")
 
-    logging.info("Loading dataset")
-    dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s)
+    episode_indices = parse_episode_ranges(episodes_str)
 
-    visualize_dataset(dataset, **vars(args))
+    print("Loading dataset")
+    dataset = LeRobotDataset(repo_id, episodes=episode_indices, root=root, tolerance_s=tolerance_s)
+
+    resolved_episode_indices = (
+        episode_indices
+        if episode_indices is not None
+        else list(range(len(dataset.meta.episodes)))
+    )
+
+    visualize_dataset(dataset, resolved_episode_indices, **kwargs)
 
 
 if __name__ == "__main__":
