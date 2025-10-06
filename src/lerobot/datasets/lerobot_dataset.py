@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
@@ -20,6 +21,7 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import datasets
 import numpy as np
@@ -31,6 +33,7 @@ import torch.utils
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
 
+from lerobot.datasets.async_video_encoder import AsyncVideoEncoder
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.datasets.utils import (
@@ -1007,9 +1010,30 @@ class LeRobotDataset(torch.utils.data.Dataset):
         has_video_keys = len(self.meta.video_keys) > 0
         use_batched_encoding = self.batch_encoding_size > 1
 
-        if has_video_keys and not use_batched_encoding:
-            for video_key in self.meta.video_keys:
-                ep_metadata.update(self._save_episode_video(video_key, episode_index))
+        # Handle video encoding based on configuration
+        if has_video_keys:
+            if hasattr(self, 'async_video_encoding') and self.async_video_encoding:
+                # Submit encoding task to async encoder
+                if self.async_video_encoder is None:
+                    self.start_async_video_encoder()
+
+                for video_key in self.meta.video_keys:
+                    success = self.async_video_encoder.submit_encoding_task(
+                        episode_index=episode_index,
+                        video_keys=[video_key],
+                        fps=self.fps,
+                        root_path=self.root,
+                        priority=0,  # Default priority
+                    )
+
+                    if not success:
+                        logging.warning(f"Failed to submit async encoding task for episode {episode_index}, video {video_key}")
+                        # Fallback to synchronous encoding
+                        ep_metadata.update(self._save_episode_video(video_key, episode_index))
+            elif not use_batched_encoding:
+                # Synchronous encoding
+                for video_key in self.meta.video_keys:
+                    ep_metadata.update(self._save_episode_video(video_key, episode_index))
 
         # `meta.save_episode` need to be executed after encoding the videos
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
@@ -1020,7 +1044,29 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if self.episodes_since_last_encoding == self.batch_encoding_size:
                 start_ep = self.num_episodes - self.batch_encoding_size
                 end_ep = self.num_episodes
-                self._batch_save_episode_video(start_ep, end_ep)
+
+                if hasattr(self, 'async_video_encoding') and self.async_video_encoding:
+                    # Submit batch encoding tasks to async encoder
+                    if self.async_video_encoder is None:
+                        self.start_async_video_encoder()
+
+                    for ep_idx in range(start_ep, end_ep):
+                        for video_key in self.meta.video_keys:
+                            success = self.async_video_encoder.submit_encoding_task(
+                                episode_index=ep_idx,
+                                video_keys=[video_key],
+                                fps=self.fps,
+                                root_path=self.root,
+                                priority=1,  # Higher priority for batch encoding
+                            )
+                            if not success:
+                                logging.warning(
+                                    f"Failed to submit async batch encoding task for episode {ep_idx}, video {video_key}"
+                                )
+                else:
+                    # Synchronous batch encoding
+                    self._batch_save_episode_video(start_ep, end_ep)
+
                 self.episodes_since_last_encoding = 0
 
         if not episode_data:
@@ -1096,7 +1142,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Convert buffer into HF Dataset
         ep_dict = {key: episode_buffer[key] for key in self.hf_features}
         ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
+        
+        # Time embed_images operation
         ep_dataset = embed_images(ep_dataset)
+        
         ep_size_in_mb = get_hf_dataset_size_in_mb(ep_dataset)
         ep_num_frames = len(ep_dataset)
         df = pd.DataFrame(ep_dataset)
@@ -1132,6 +1181,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Write the resulting dataframe from RAM to disk
         path = self.root / self.meta.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
         path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Time parquet write operation
         if len(self.meta.image_keys) > 0:
             to_parquet_with_hf_images(df, path)
         else:
@@ -1258,6 +1309,32 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_writer is not None:
             self.image_writer.wait_until_done()
 
+    def start_async_video_encoder(self) -> None:
+        """Start the async video encoder."""
+        if hasattr(self, 'async_video_encoding') and self.async_video_encoding and self.async_video_encoder is None:
+            self.async_video_encoder = AsyncVideoEncoder(
+                num_workers=self.video_encoding_workers,
+                max_queue_size=self.video_encoding_queue_size,
+                enable_logging=True,
+                gpu_encoding=self.gpu_video_encoding,
+                gpu_encoder_config=self.gpu_encoder_config,
+            )
+            self.async_video_encoder.start()
+            logging.info(f"Started async video encoder with {self.video_encoding_workers} workers")
+
+    def stop_async_video_encoder(self, wait: bool = True) -> None:
+        """Stop the async video encoder."""
+        if hasattr(self, 'async_video_encoder') and self.async_video_encoder is not None:
+            self.async_video_encoder.stop(wait=wait)
+            self.async_video_encoder = None
+            logging.info("Stopped async video encoder")
+
+    def wait_for_async_encoding(self, timeout: float | None = None) -> bool:
+        """Wait for all async encoding tasks to complete."""
+        if hasattr(self, 'async_video_encoder') and self.async_video_encoder is not None:
+            return self.async_video_encoder.wait_for_completion(timeout=timeout)
+        return True
+
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """
         Use ffmpeg to convert frames stored as png into mp4 videos.
@@ -1284,6 +1361,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         image_writer_threads: int = 0,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        async_video_encoding: bool = False,
+        video_encoding_workers: int = 2,
+        video_encoding_queue_size: int = 100,
+        gpu_video_encoding: bool = False,
+        gpu_encoder_config: dict[str, Any] | None = None,
     ) -> "LeRobotDataset":
         """Create a LeRobot Dataset from scratch in order to record data."""
         obj = cls.__new__(cls)
@@ -1303,8 +1385,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.batch_encoding_size = batch_encoding_size
         obj.episodes_since_last_encoding = 0
 
+        # Async video encoding configuration
+        obj.async_video_encoding = async_video_encoding
+        obj.video_encoding_workers = video_encoding_workers
+        obj.video_encoding_queue_size = video_encoding_queue_size
+        obj.async_video_encoder = None
+
+        # GPU video encoding configuration (independent of async encoding)
+        obj.gpu_video_encoding = gpu_video_encoding
+        obj.gpu_encoder_config = gpu_encoder_config
+
         if image_writer_processes or image_writer_threads:
             obj.start_image_writer(image_writer_processes, image_writer_threads)
+
+        # Start async video encoder if enabled
+        if obj.async_video_encoding:
+            obj.start_async_video_encoder()
 
         # TODO(aliberts, rcadene, alexander-soare): Merge this with OnlineBuffer/DataBuffer
         obj.episode_buffer = obj.create_episode_buffer()
@@ -1316,6 +1412,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.delta_indices = None
         obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
         return obj
+
+    def __del__(self):
+        """Cleanup when the dataset is destroyed."""
+        if hasattr(self, "async_video_encoder") and self.async_video_encoder is not None:
+            self.stop_async_video_encoder(wait=False)
 
 
 class MultiLeRobotDataset(torch.utils.data.Dataset):
